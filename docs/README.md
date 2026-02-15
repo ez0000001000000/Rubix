@@ -1,7 +1,5 @@
 # Rubix Framework Documentation
 # Comprehensive documentation for the Rubix Ruby web framework
-
-=begin
 # Rubix Framework
 
 A comprehensive Ruby web framework with ORM, authentication, web server, and more.
