@@ -1,0 +1,993 @@
+# Build scripts and deployment tools
+# This file contains build, deployment, and maintenance scripts
+
+require 'rubygems'
+require 'bundler/setup'
+require 'fileutils'
+require 'yaml'
+require 'json'
+require 'erb'
+require 'pathname'
+require 'time'
+
+module Rubix
+  module Build
+    # Build configuration
+    class Config
+      attr_accessor :name, :version, :description, :author, :email,
+                    :homepage, :license, :ruby_version, :dependencies,
+                    :development_dependencies, :executables, :files,
+                    :test_files, :require_paths, :extensions
+
+      def initialize
+        @name = 'rubix-app'
+        @version = '0.1.0'
+        @description = 'A Rubix Framework application'
+        @author = 'Developer'
+        @email = 'developer@example.com'
+        @homepage = 'https://example.com'
+        @license = 'MIT'
+        @ruby_version = '>= 2.7.0'
+        @dependencies = {}
+        @development_dependencies = {
+          'minitest' => '>= 5.0.0',
+          'rack-test' => '>= 0.6.0',
+          'simplecov' => '>= 0.16.0'
+        }
+        @executables = []
+        @files = ['lib/**/*', 'bin/*', 'config/**/*', 'db/**/*']
+        @test_files = ['test/**/*', 'spec/**/*']
+        @require_paths = ['lib']
+        @extensions = []
+      end
+
+      def to_gemspec
+        Gem::Specification.new do |spec|
+          spec.name          = @name
+          spec.version       = @version
+          spec.authors       = [@author]
+          spec.email         = [@email]
+          spec.description   = @description
+          spec.summary       = @description
+          spec.homepage      = @homepage
+          spec.license       = @license
+
+          spec.required_ruby_version = @ruby_version
+
+          spec.files         = Dir.glob(@files)
+          spec.test_files    = Dir.glob(@test_files)
+          spec.executables   = @executables
+          spec.require_paths = @require_paths
+          spec.extensions    = @extensions
+
+          @dependencies.each do |name, version|
+            spec.add_dependency name, version
+          end
+
+          @development_dependencies.each do |name, version|
+            spec.add_development_dependency name, version
+          end
+        end
+      end
+
+      def to_hash
+        {
+          name: @name,
+          version: @version,
+          description: @description,
+          author: @author,
+          email: @email,
+          homepage: @homepage,
+          license: @license,
+          ruby_version: @ruby_version,
+          dependencies: @dependencies,
+          development_dependencies: @development_dependencies,
+          executables: @executables,
+          files: @files,
+          test_files: @test_files,
+          require_paths: @require_paths,
+          extensions: @extensions
+        }
+      end
+    end
+
+    # Build system
+    class Builder
+      def initialize(config = nil)
+        @config = config || Config.new
+        @build_dir = 'build'
+        @dist_dir = 'dist'
+      end
+
+      def clean
+        FileUtils.rm_rf(@build_dir)
+        FileUtils.rm_rf(@dist_dir)
+        puts "Cleaned build directories"
+      end
+
+      def compile
+        create_build_directory
+        copy_source_files
+        compile_extensions if @config.extensions.any?
+        puts "Compiled successfully"
+      end
+
+      def test
+        system('ruby -I lib test/test_helper.rb') || raise('Tests failed')
+        puts "Tests passed"
+      end
+
+      def package
+        compile
+        create_gem
+        create_archive
+        puts "Packaged successfully"
+      end
+
+      def install
+        package
+        gem_file = Dir.glob("#{@dist_dir}/*.gem").first
+        system("gem install #{gem_file}") || raise('Installation failed')
+        puts "Installed successfully"
+      end
+
+      def release
+        test
+        package
+        tag_version
+        push_to_rubygems
+        puts "Released version #{@config.version}"
+      end
+
+      private
+
+      def create_build_directory
+        FileUtils.mkdir_p(@build_dir)
+      end
+
+      def copy_source_files
+        @config.files.each do |pattern|
+          Dir.glob(pattern).each do |file|
+            next if File.directory?(file)
+            dest_file = File.join(@build_dir, file)
+            FileUtils.mkdir_p(File.dirname(dest_file))
+            FileUtils.cp(file, dest_file)
+          end
+        end
+      end
+
+      def compile_extensions
+        @config.extensions.each do |ext|
+          Dir.chdir(@build_dir) do
+            system("ruby extconf.rb && make") || raise("Failed to compile extension #{ext}")
+          end
+        end
+      end
+
+      def create_gem
+        FileUtils.mkdir_p(@dist_dir)
+        gemspec = @config.to_gemspec
+        gemspec_file = "#{@config.name}-#{@config.version}.gemspec"
+
+        File.write(gemspec_file, gemspec.to_ruby)
+        system("gem build #{gemspec_file}") || raise('Gem build failed')
+
+        gem_file = "#{@config.name}-#{@config.version}.gem"
+        FileUtils.mv(gem_file, @dist_dir)
+        FileUtils.rm(gemspec_file)
+      end
+
+      def create_archive
+        Dir.chdir(@build_dir) do
+          archive_name = "#{@config.name}-#{@config.version}.tar.gz"
+          system("tar -czf ../#{@dist_dir}/#{archive_name} .") || raise('Archive creation failed')
+        end
+      end
+
+      def tag_version
+        system("git tag v#{@config.version}") || raise('Git tagging failed')
+        system("git push origin v#{@config.version}") || raise('Git push failed')
+      end
+
+      def push_to_rubygems
+        gem_file = Dir.glob("#{@dist_dir}/*.gem").first
+        system("gem push #{gem_file}") || raise('Gem push failed')
+      end
+    end
+
+    # Development server
+    class DevServer
+      def initialize(config = {})
+        @config = {
+          host: 'localhost',
+          port: 3000,
+          reload: true,
+          reload_paths: ['lib', 'app'],
+          reload_extensions: ['.rb', '.erb']
+        }.merge(config)
+
+        @server_thread = nil
+        @watcher_thread = nil
+      end
+
+      def start
+        puts "Starting development server on #{@config[:host]}:#{@config[:port]}"
+
+        @server_thread = Thread.new do
+          Rubix.run!
+        end
+
+        if @config[:reload]
+          start_file_watcher
+        end
+
+        @server_thread.join
+      end
+
+      def stop
+        @server_thread&.kill
+        @watcher_thread&.kill
+        puts "Development server stopped"
+      end
+
+      private
+
+      def start_file_watcher
+        @watcher_thread = Thread.new do
+          last_mtimes = get_file_mtimes
+
+          loop do
+            sleep 1
+            current_mtimes = get_file_mtimes
+
+            if files_changed?(last_mtimes, current_mtimes)
+              puts "Files changed, reloading..."
+              restart_server
+              last_mtimes = current_mtimes
+            end
+          end
+        end
+      end
+
+      def get_file_mtimes
+        mtimes = {}
+        @config[:reload_paths].each do |path|
+          Dir.glob("#{path}/**/*#{@config[:reload_extensions].join(',')}").each do |file|
+            mtimes[file] = File.mtime(file) if File.exist?(file)
+          end
+        end
+        mtimes
+      end
+
+      def files_changed?(old_mtimes, new_mtimes)
+        old_mtimes != new_mtimes
+      end
+
+      def restart_server
+        # In a real implementation, you'd gracefully restart the server
+        # For simplicity, we'll just print a message
+        puts "Server would restart here"
+      end
+    end
+
+    # Database tasks
+    class DatabaseTasks
+      def initialize(config = {})
+        @config = config
+        @migrations_path = 'db/migrate'
+        @schema_file = 'db/schema.rb'
+      end
+
+      def create
+        ensure_db_dir
+        # Create database based on adapter
+        case @config[:adapter]
+        when 'sqlite3'
+          # SQLite databases are created automatically
+          puts "SQLite database will be created automatically"
+        else
+          puts "Database creation not implemented for #{@config[:adapter]}"
+        end
+      end
+
+      def drop
+        # Drop database
+        case @config[:adapter]
+        when 'sqlite3'
+          db_file = @config[:database]
+          File.delete(db_file) if File.exist?(db_file)
+          puts "Dropped SQLite database #{db_file}"
+        else
+          puts "Database drop not implemented for #{@config[:adapter]}"
+        end
+      end
+
+      def migrate(version = nil)
+        require 'rubix'
+
+        if version
+          Rubix::Database::Migrator.migrate_to(version)
+        else
+          Rubix::Database::Migrator.migrate
+        end
+
+        dump_schema
+        puts "Migrated to version #{version || 'latest'}"
+      end
+
+      def rollback(steps = 1)
+        require 'rubix'
+
+        Rubix::Database::Migrator.rollback(steps)
+        dump_schema
+        puts "Rolled back #{steps} migration(s)"
+      end
+
+      def reset
+        drop
+        create
+        migrate
+        puts "Reset database"
+      end
+
+      def seed
+        seed_file = 'db/seeds.rb'
+        if File.exist?(seed_file)
+          load seed_file
+          puts "Seeded database"
+        else
+          puts "No seed file found at #{seed_file}"
+        end
+      end
+
+      def setup
+        create
+        migrate
+        seed
+        puts "Database setup complete"
+      end
+
+      def version
+        require 'rubix'
+        # This would query the schema_migrations table
+        puts "Current database version: #{get_current_version}"
+      end
+
+      private
+
+      def ensure_db_dir
+        FileUtils.mkdir_p('db')
+      end
+
+      def dump_schema
+        require 'rubix'
+
+        schema_content = generate_schema_dump
+        File.write(@schema_file, schema_content)
+      end
+
+      def generate_schema_dump
+        # Generate schema dump
+        "# Schema dump generated at #{Time.now}\n"
+      end
+
+      def get_current_version
+        # Query current migration version
+        'unknown'
+      end
+    end
+
+    # Asset pipeline
+    class AssetPipeline
+      def initialize(config = {})
+        @config = {
+          source_dir: 'app/assets',
+          build_dir: 'public/assets',
+          compress: true,
+          fingerprint: true,
+          manifest_file: 'public/assets/manifest.json'
+        }.merge(config)
+
+        @manifest = {}
+      end
+
+      def compile
+        ensure_build_dir
+        compile_stylesheets
+        compile_javascripts
+        process_images
+        generate_manifest
+        puts "Assets compiled successfully"
+      end
+
+      def clean
+        FileUtils.rm_rf(@config[:build_dir])
+        puts "Cleaned asset build directory"
+      end
+
+      def watch
+        puts "Watching assets for changes..."
+
+        last_mtimes = get_asset_mtimes
+
+        loop do
+          sleep 1
+          current_mtimes = get_asset_mtimes
+
+          if assets_changed?(last_mtimes, current_mtimes)
+            puts "Assets changed, recompiling..."
+            compile
+            last_mtimes = current_mtimes
+          end
+        end
+      end
+
+      private
+
+      def ensure_build_dir
+        FileUtils.mkdir_p(@config[:build_dir])
+      end
+
+      def compile_stylesheets
+        Dir.glob("#{@config[:source_dir]}/stylesheets/**/*.css").each do |file|
+          compile_asset(file, 'stylesheets')
+        end
+
+        Dir.glob("#{@config[:source_dir]}/stylesheets/**/*.scss").each do |file|
+          compile_sass(file) if sass_available?
+        end
+      end
+
+      def compile_javascripts
+        Dir.glob("#{@config[:source_dir]}/javascripts/**/*.js").each do |file|
+          compile_asset(file, 'javascripts')
+        end
+
+        Dir.glob("#{@config[:source_dir]}/javascripts/**/*.coffee").each do |file|
+          compile_coffee(file) if coffee_available?
+        end
+      end
+
+      def process_images
+        Dir.glob("#{@config[:source_dir]}/images/**/*.{jpg,jpeg,png,gif,svg}").each do |file|
+          copy_asset(file, 'images')
+        end
+      end
+
+      def compile_asset(source_file, type)
+        content = File.read(source_file)
+        content = compress_content(content, File.extname(source_file)) if @config[:compress]
+
+        dest_file = generate_dest_path(source_file, type)
+        FileUtils.mkdir_p(File.dirname(dest_file))
+        File.write(dest_file, content)
+
+        @manifest[File.basename(source_file)] = File.basename(dest_file)
+      end
+
+      def compile_sass(file)
+        # Sass compilation would go here
+        compile_asset(file, 'stylesheets')
+      end
+
+      def compile_coffee(file)
+        # CoffeeScript compilation would go here
+        compile_asset(file, 'javascripts')
+      end
+
+      def copy_asset(source_file, type)
+        dest_file = generate_dest_path(source_file, type)
+        FileUtils.mkdir_p(File.dirname(dest_file))
+        FileUtils.cp(source_file, dest_file)
+
+        @manifest[File.basename(source_file)] = File.basename(dest_file)
+      end
+
+      def generate_dest_path(source_file, type)
+        relative_path = Pathname.new(source_file).relative_path_from(Pathname.new(@config[:source_dir]))
+        base_name = File.basename(relative_path, '.*')
+        extension = File.extname(relative_path)
+
+        if @config[:fingerprint]
+          fingerprint = Digest::MD5.hexdigest(File.read(source_file))[0..7]
+          "#{@config[:build_dir]}/#{type}/#{base_name}-#{fingerprint}#{extension}"
+        else
+          "#{@config[:build_dir]}/#{type}/#{base_name}#{extension}"
+        end
+      end
+
+      def compress_content(content, extension)
+        case extension
+        when '.css'
+          compress_css(content)
+        when '.js'
+          compress_js(content)
+        else
+          content
+        end
+      end
+
+      def compress_css(content)
+        # Simple CSS compression (remove whitespace and comments)
+        content.gsub(/\s+/, ' ').gsub(/\/\*.*?\*\//, '').strip
+      end
+
+      def compress_js(content)
+        # Simple JS compression (remove extra whitespace)
+        content.gsub(/\s+/, ' ').strip
+      end
+
+      def generate_manifest
+        File.write(@config[:manifest_file], JSON.pretty_generate(@manifest))
+      end
+
+      def get_asset_mtimes
+        mtimes = {}
+        Dir.glob("#{@config[:source_dir]}/**/*").each do |file|
+          next if File.directory?(file)
+          mtimes[file] = File.mtime(file)
+        end
+        mtimes
+      end
+
+      def assets_changed?(old_mtimes, new_mtimes)
+        old_mtimes != new_mtimes
+      end
+
+      def sass_available?
+        begin
+          require 'sass'
+          true
+        rescue LoadError
+          false
+        end
+      end
+
+      def coffee_available?
+        begin
+          require 'coffee-script'
+          true
+        rescue LoadError
+          false
+        end
+      end
+    end
+
+    # Command line interface
+    class CLI
+      def self.run(args)
+        command = args.shift || 'help'
+
+        case command
+        when 'new'
+          create_new_app(args.first)
+        when 'server', 's'
+          start_server(args)
+        when 'console', 'c'
+          start_console
+        when 'generate', 'g'
+          run_generator(args)
+        when 'db'
+          run_db_task(args)
+        when 'assets'
+          run_asset_task(args)
+        when 'test', 't'
+          run_tests(args)
+        when 'build'
+          run_build(args)
+        when 'help', '-h', '--help'
+          show_help
+        else
+          puts "Unknown command: #{command}"
+          show_help
+        end
+      end
+
+      private
+
+      def self.create_new_app(name)
+        if name.nil?
+          puts "Please specify an application name"
+          puts "Usage: rubix new <app_name>"
+          return
+        end
+
+        puts "Creating new Rubix application: #{name}"
+
+        # Create directory structure
+        FileUtils.mkdir_p(name)
+        Dir.chdir(name) do
+          create_app_structure
+          puts "Application created successfully!"
+          puts "Run 'cd #{name} && rubix server' to start the development server"
+        end
+      end
+
+      def self.create_app_structure
+        # Create directories
+        dirs = [
+          'app/controllers',
+          'app/models',
+          'app/views',
+          'app/assets/stylesheets',
+          'app/assets/javascripts',
+          'app/assets/images',
+          'config',
+          'db/migrate',
+          'lib',
+          'public',
+          'test'
+        ]
+
+        dirs.each { |dir| FileUtils.mkdir_p(dir) }
+
+        # Create basic files
+        create_file('config/application.rb', application_config_content)
+        create_file('config/database.yml', database_config_content)
+        create_file('config/routes.rb', routes_content)
+        create_file('app/controllers/application_controller.rb', application_controller_content)
+        create_file('app/controllers/home_controller.rb', home_controller_content)
+        create_file('Gemfile', gemfile_content)
+        create_file('Rakefile', rakefile_content)
+        create_file('README.md', readme_content)
+      end
+
+      def self.start_server(args)
+        require_relative 'lib/rubix'
+        require_relative 'config/application'
+
+        server_config = {
+          host: 'localhost',
+          port: 3000,
+          reload: true
+        }
+
+        # Parse command line options
+        # ... option parsing logic ...
+
+        DevServer.new(server_config).start
+      end
+
+      def self.start_console
+        require 'irb'
+        require_relative 'lib/rubix'
+        require_relative 'config/application'
+
+        puts "Rubix Console - type 'exit' to quit"
+        IRB.start
+      end
+
+      def self.run_generator(args)
+        generator = args.shift
+        name = args.shift
+
+        case generator
+        when 'controller'
+          generate_controller(name, args)
+        when 'model'
+          generate_model(name, args)
+        when 'migration'
+          generate_migration(name, args)
+        else
+          puts "Unknown generator: #{generator}"
+        end
+      end
+
+      def self.run_db_task(args)
+        task = args.shift
+
+        db_tasks = DatabaseTasks.new(Rubix.config.database_config)
+
+        case task
+        when 'create'
+          db_tasks.create
+        when 'drop'
+          db_tasks.drop
+        when 'migrate'
+          db_tasks.migrate(args.first)
+        when 'rollback'
+          db_tasks.rollback(args.first&.to_i || 1)
+        when 'reset'
+          db_tasks.reset
+        when 'seed'
+          db_tasks.seed
+        when 'setup'
+          db_tasks.setup
+        when 'version'
+          db_tasks.version
+        else
+          puts "Unknown database task: #{task}"
+        end
+      end
+
+      def self.run_asset_task(args)
+        task = args.shift
+
+        asset_pipeline = AssetPipeline.new
+
+        case task
+        when 'compile'
+          asset_pipeline.compile
+        when 'clean'
+          asset_pipeline.clean
+        when 'watch'
+          asset_pipeline.watch
+        else
+          puts "Unknown asset task: #{task}"
+        end
+      end
+
+      def self.run_tests(args)
+        require 'rubix/testing'
+
+        suite = Rubix::Testing::TestSuite.new
+
+        if args.empty?
+          suite.run_test_directory('test')
+        else
+          args.each do |test_file|
+            suite.run_test_file(test_file)
+          end
+        end
+      end
+
+      def self.run_build(args)
+        task = args.shift || 'package'
+
+        builder = Builder.new
+
+        case task
+        when 'clean'
+          builder.clean
+        when 'compile'
+          builder.compile
+        when 'test'
+          builder.test
+        when 'package'
+          builder.package
+        when 'install'
+          builder.install
+        when 'release'
+          builder.release
+        else
+          puts "Unknown build task: #{task}"
+        end
+      end
+
+      def self.show_help
+        puts <<-HELP
+Rubix Framework CLI
+
+Usage: rubix <command> [options]
+
+Commands:
+  new <name>              Create a new Rubix application
+  server, s               Start the development server
+  console, c              Start the Rubix console
+  generate, g             Generate code (controller, model, migration)
+  db                      Database tasks (create, migrate, rollback, etc.)
+  assets                  Asset pipeline tasks (compile, clean, watch)
+  test, t                 Run tests
+  build                   Build tasks (clean, compile, package, install, release)
+
+Examples:
+  rubix new my_app
+  rubix server
+  rubix generate controller users
+  rubix db migrate
+  rubix test
+        HELP
+      end
+
+      # Template methods for file creation
+      def self.create_file(path, content)
+        FileUtils.mkdir_p(File.dirname(path))
+        File.write(path, content)
+      end
+
+      def self.application_config_content
+        <<-RUBY
+require 'rubix'
+
+Rubix.configure do |config|
+  # Database configuration
+  config.database_adapter = 'sqlite3'
+  config.database_database = 'db/development.sqlite3'
+
+  # Server configuration
+  config.server_port = 3000
+  config.server_host = 'localhost'
+
+  # Other configurations...
+end
+
+# Load routes
+require_relative 'routes'
+        RUBY
+      end
+
+      def self.database_config_content
+        <<-YAML
+development:
+  adapter: sqlite3
+  database: db/development.sqlite3
+
+test:
+  adapter: sqlite3
+  database: db/test.sqlite3
+
+production:
+  adapter: sqlite3
+  database: db/production.sqlite3
+        YAML
+      end
+
+      def self.routes_content
+        <<-RUBY
+require 'rubix'
+
+Rubix.get '/', to: 'home#index'
+        RUBY
+      end
+
+      def self.application_controller_content
+        <<-RUBY
+class ApplicationController < Rubix::Web::Controller
+  # Common controller logic goes here
+end
+        RUBY
+      end
+
+      def self.home_controller_content
+        <<-RUBY
+class HomeController < ApplicationController
+  def index
+    render html: '<h1>Welcome to Rubix!</h1><p>Your application is running successfully.</p>'
+  end
+end
+        RUBY
+      end
+
+      def self.gemfile_content
+        <<-RUBY
+source 'https://rubygems.org'
+
+gem 'rubix-framework'
+gem 'sqlite3'
+
+group :development, :test do
+  gem 'minitest'
+  gem 'rack-test'
+end
+        RUBY
+      end
+
+      def self.rakefile_content
+        <<-RUBY
+require 'rubix/build'
+
+task :default => :test
+
+desc "Run tests"
+task :test do
+  Rubix::Build::CLI.run(['test'])
+end
+
+desc "Start development server"
+task :server do
+  Rubix::Build::CLI.run(['server'])
+end
+
+desc "Generate gemspec"
+task :gemspec do
+  # Generate gemspec logic
+end
+        RUBY
+      end
+
+      def self.readme_content
+        <<-MARKDOWN
+# #{File.basename(Dir.pwd).titleize}
+
+A Rubix Framework application.
+
+## Getting Started
+
+1. Install dependencies:
+   ```bash
+   bundle install
+   ```
+
+2. Setup the database:
+   ```bash
+   rubix db setup
+   ```
+
+3. Start the development server:
+   ```bash
+   rubix server
+   ```
+
+4. Visit http://localhost:3000 in your browser.
+
+## Available Commands
+
+- `rubix server` - Start the development server
+- `rubix console` - Start the Rubix console
+- `rubix db migrate` - Run database migrations
+- `rubix test` - Run tests
+- `rubix generate controller <name>` - Generate a new controller
+
+## License
+
+This project is licensed under the MIT License.
+        MARKDOWN
+      end
+
+      def self.generate_controller(name, actions = [])
+        controller_name = "#{name.classify}Controller"
+        file_name = "#{name.underscore}_controller.rb"
+        path = "app/controllers/#{file_name}"
+
+        content = <<-RUBY
+class #{controller_name} < ApplicationController
+#{actions.map { |action| "  def #{action}\n  end\n" }.join("\n")}
+end
+        RUBY
+
+        create_file(path, content)
+        puts "Created controller: #{path}"
+      end
+
+      def self.generate_model(name, attributes = [])
+        model_name = name.classify
+        file_name = "#{name.underscore}.rb"
+        path = "app/models/#{file_name}"
+
+        attr_lines = attributes.map do |attr|
+          parts = attr.split(':')
+          attr_name = parts[0]
+          attr_type = parts[1] || 'string'
+          "  column :#{attr_name}, :#{attr_type}"
+        end
+
+        content = <<-RUBY
+class #{model_name} < Rubix::Database::Model
+#{attr_lines.join("\n")}
+
+  # Add validations, associations, and methods here
+end
+        RUBY
+
+        create_file(path, content)
+        puts "Created model: #{path}"
+      end
+
+      def self.generate_migration(name, options = [])
+        timestamp = Time.now.strftime('%Y%m%d%H%M%S')
+        file_name = "#{timestamp}_#{name.underscore}.rb"
+        path = "db/migrate/#{file_name}"
+
+        content = <<-RUBY
+class #{name.classify} < Rubix::Database::Migration
+  def up
+    # Add migration logic here
+  end
+
+  def down
+    # Add rollback logic here
+  end
+end
+        RUBY
+
+        create_file(path, content)
+        puts "Created migration: #{path}"
+      end
+    end
+  end
+end
+
+# Command line entry point
+if __FILE__ == $0
+  Rubix::Build::CLI.run(ARGV)
+end
